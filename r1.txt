@@ -1,0 +1,444 @@
+# https://www.cisco.com/c/en/us/td/docs/iosxr/ncs5500/segment-routing/78x/b-segment-routing-cg-ncs5500-78x/configure-srv6-micro-sid.html
+
+---各loopbackへの経路情報をISISで交換---
+
+router isis 1
+ is-type level-2-only
+ net 49.0000.0000.0001.00
+ address-family ipv6 unicast
+  metric-style wide
+ !
+ interface Loopback0
+  no address-family ipv4 unicast
+  address-family ipv6 unicast
+  !
+ !
+ interface GigabitEthernet0/0/0/0
+  point-to-point
+  address-family ipv6 unicast
+  !
+ !
+ interface GigabitEthernet0/0/0/1
+  point-to-point
+  address-family ipv6 unicast
+  !
+ !
+!
+
+---SRv6 ロケーターの設定---
+LocatorはSR-MPLSでいうラベル
+
+segment-routing
+  srv6
+    locators
+      locator MAIN
+        micro-segment behavior unode psp-usd
+        prefix fcbb:bb00:1::/48
+
+# 'default'はdefault VRF
+# uN = uN SIDはNode SIDを表している
+
+RP/0/RP0/CPU0:r1#show segment-routing srv6 sid all
+Mon Jan 30 05:07:00.722 UTC
+
+*** Locator: 'MAIN' ***
+
+SID                         Behavior          Context                           Owner               State  RW
+--------------------------  ----------------  ------------------------------    ------------------  -----  --
+fcbb:bb00:1::               uN (PSP/USD)      'default':1                       sidmgr              InUse  Y
+
+
+
+---ISISでLocatorを使う設定を入れる---
+
+configure
+  router isis 1
+    address-family ipv6 unicast
+      segment-routing srv6
+        locator MAIN
+
+
+# Adj SIDが付与される
+# uA = Adj SID
+RP/0/RP0/CPU0:r1#show segment-routing srv6 sid all
+Mon Jan 30 05:27:04.435 UTC
+
+*** Locator: 'MAIN' ***
+
+SID                         Behavior          Context                           Owner               State  RW
+--------------------------  ----------------  ------------------------------    ------------------  -----  --
+fcbb:bb00:1::               uN (PSP/USD)      'default':1                       sidmgr              InUse  Y
+fcbb:bb00:1:e000::          uA (PSP/USD)      [Gi0/0/0/0, Link-Local]:0         isis-1              InUse  Y
+fcbb:bb00:1:e001::          uA (PSP/USD)      [Gi0/0/0/1, Link-Local]:0         isis-1              InUse  Y
+
+
+---R1,R3間でのL3VPN---
+
+# L3VPN用のルートを広報するためにBGPを使用
+# VRF, rd,rtの設定
+
+configure
+vrf 1
+address-family ipv4 unicast
+ import route-target
+   1:1
+ !
+ export route-target
+   1:1
+
+---BGP Peering, VRFごとにSIDを割り当てる---
+
+# vrf 1に所属しているPrefixに対して、SID Function(End DT4とか)を割り当てる
+
+router bgp 1
+ address-family vpnv4 unicast
+ !
+ vrf 1
+  rd 1:1
+  address-family ipv4 unicast
+   segment-routing srv6
+    locator MAIN
+    alloc mode per-vrf
+   !
+   redistribute connected
+  !
+ !
+!
+
+# SRv6でEncapする際のSource Addressを設定する必要がある
+# 2001::1はlo0のアドレス
+
+configure
+  segment-routing
+    srv6
+      encapsulation
+        source-address 2001::1
+
+# vrf 1 DT4用のFunctionのSIDが割り当てられる
+
+RP/0/RP0/CPU0:r1#show segment-routing srv6 sid all
+Mon Jan 30 06:13:59.293 UTC
+
+*** Locator: 'MAIN' ***
+
+SID                         Behavior          Context                           Owner               State  RW
+--------------------------  ----------------  ------------------------------    ------------------  -----  --
+fcbb:bb00:1::               uN (PSP/USD)      'default':1                       sidmgr              InUse  Y
+fcbb:bb00:1:e000::          uA (PSP/USD)      [Gi0/0/0/0, Link-Local]:0         isis-1              InUse  Y
+fcbb:bb00:1:e001::          uA (PSP/USD)      [Gi0/0/0/1, Link-Local]:0         isis-1              InUse  Y
+fcbb:bb00:1:e002::          uDT4              '1'                               bgp-1               InUse  Y
+
+# BGPで経路を広報する
+# ネイバーはr3のlo0
+router bgp 1
+ bgp router-id 1.1.1.1
+ address-family vpnv4 unicast
+ !
+ neighbor 2001::3
+  remote-as 1
+  update-source Loopback0
+  address-family vpnv4 unicast
+  !
+ !
+!
+
+
+RP/0/RP0/CPU0:r1#show route vrf 1 ipv4
+Mon Jan 30 06:20:13.560 UTC
+
+Codes: C - connected, S - static, R - RIP, B - BGP, (>) - Diversion path
+       D - EIGRP, EX - EIGRP external, O - OSPF, IA - OSPF inter area
+       N1 - OSPF NSSA external type 1, N2 - OSPF NSSA external type 2
+       E1 - OSPF external type 1, E2 - OSPF external type 2, E - EGP
+       i - ISIS, L1 - IS-IS level-1, L2 - IS-IS level-2
+       ia - IS-IS inter area, su - IS-IS summary null, * - candidate default
+       U - per-user static route, o - ODR, L - local, G  - DAGR, l - LISP
+       A - access/subscriber, a - Application route
+       M - mobile route, r - RPL, t - Traffic Engineering, (!) - FRR Backup path
+
+Gateway of last resort is not set
+
+C    10.1.6.0/24 is directly connected, 00:34:57, GigabitEthernet0/0/0/2
+L    10.1.6.1/32 is directly connected, 00:34:57, GigabitEthernet0/0/0/2
+B    10.3.7.0/24 [200/0] via 2001::3 (nexthop in vrf default), 00:00:22
+
+
+# next hopはVRF Defaultのfcbb:bb00:3::/128 = これはR3のuN(Node SID)
+# SID-Listのfcbb:bb00:3:e002::はL3VPNのDT4 Function
+
+RP/0/RP0/CPU0:r1#show cef vrf 1 10.3.7.0/24
+Mon Jan 30 06:25:05.863 UTC
+10.3.7.0/24, version 3, SRv6 Headend, internal 0x5000001 0x30 (ptr 0xd9620c0) [1], 0x0 (0xe365888), 0x0 (0xf6363c0)
+ Updated Jan 30 06:19:51.770
+ Prefix Len 24, traffic index 0, precedence n/a, priority 3
+   via fcbb:bb00:3::/128, 3 dependencies, recursive [flags 0x6000]
+    path-idx 0 NHID 0x0 [0xe495a48 0x0]
+    next hop VRF - 'default', table - 0xe0800000
+    next hop fcbb:bb00:3::/128 via fcbb:bb00:3::/48
+    SRv6 H.Encaps.Red SID-list {fcbb:bb00:3:e002::}
+
+
+# R3のSID List
+RP/0/RP0/CPU0:r3#show segment-routing srv6 sid all
+Mon Jan 30 06:28:32.155 UTC
+
+*** Locator: 'MAIN' ***
+
+SID                         Behavior          Context                           Owner               State  RW
+--------------------------  ----------------  ------------------------------    ------------------  -----  --
+fcbb:bb00:3::               uN (PSP/USD)      'default':3                       sidmgr              InUse  Y
+fcbb:bb00:3:e000::          uA (PSP/USD)      [Gi0/0/0/0, Link-Local]:0         isis-1              InUse  Y
+fcbb:bb00:3:e001::          uA (PSP/USD)      [Gi0/0/0/1, Link-Local]:0         isis-1              InUse  Y
+fcbb:bb00:3:e002::          uDT4              '1'                               bgp-1               InUse  Y
+
+
+# CE Router(r6,すぐ左につながっている奴)へBGP Neighborを貼る
+# r7へのルートをr6へ広報するため
+
+route-policy PASS
+  pass
+end-policy
+!
+router bgp 1
+ vrf 1
+  neighbor 10.1.6.6
+   remote-as 6
+   address-family ipv4 unicast
+    route-policy PASS in
+    route-policy PASS out
+   !
+  !
+ !
+!
+
+# ↓R6にもBGPの設定を入れる
+
+configure
+route-policy PASS
+ pass
+end-policy
+!
+router bgp 6
+address-family ipv4 unicast
+ redistribute connected
+!
+neighbor 10.1.6.1
+ remote-as 1
+ address-family ipv4 unicast
+ route-policy PASS in
+ route-policy PASS out
+ commit
+ end
+
+RP/0/RP0/CPU0:r6#show route
+Mon Jan 30 06:37:32.601 UTC
+
+Codes: C - connected, S - static, R - RIP, B - BGP, (>) - Diversion path
+       D - EIGRP, EX - EIGRP external, O - OSPF, IA - OSPF inter area
+       N1 - OSPF NSSA external type 1, N2 - OSPF NSSA external type 2
+       E1 - OSPF external type 1, E2 - OSPF external type 2, E - EGP
+       i - ISIS, L1 - IS-IS level-1, L2 - IS-IS level-2
+       ia - IS-IS inter area, su - IS-IS summary null, * - candidate default
+       U - per-user static route, o - ODR, L - local, G  - DAGR, l - LISP
+       A - access/subscriber, a - Application route
+       M - mobile route, r - RPL, t - Traffic Engineering, (!) - FRR Backup path
+
+Gateway of last resort is 198.18.1.1 to network 0.0.0.0
+
+S*   0.0.0.0/0 [1/0] via 198.18.1.1, 05:05:34
+L    6.6.6.6/32 is directly connected, 05:05:57, Loopback0
+B    7.7.7.7/32 [20/0] via 10.1.6.1, 00:01:53
+C    10.1.6.0/24 is directly connected, 05:05:34, GigabitEthernet0/0/0/0
+L    10.1.6.6/32 is directly connected, 05:05:34, GigabitEthernet0/0/0/0
+B    10.3.7.0/24 [20/0] via 10.1.6.1, 00:02:21
+C    198.18.1.0/24 is directly connected, 05:05:34, MgmtEth0/RP0/CPU0/0
+L    198.18.1.36/32 is directly connected, 05:05:34, MgmtEth0/RP0/CPU0/0
+
+
+
+# r1の7.7.7,7/32へのnext hopはVRF Defaultのfcbb:bb00:3::/128 = これはR3のuN(Node SID)
+# SID-Listのfcbb:bb00:3:e002::はL3VPNのDT4 Function
+
+RP/0/RP0/CPU0:r1#show cef vrf 1 7.7.7.7/32
+Mon Jan 30 06:48:34.725 UTC
+7.7.7.7/32, version 9, SRv6 Headend, internal 0x5000001 0x30 (ptr 0xd2ca160) [1], 0x0 (0xe365960), 0x0 (0xf636408)
+ Updated Jan 30 06:35:38.190
+ Prefix Len 32, traffic index 0, precedence n/a, priority 3
+   via fcbb:bb00:3::/128, 3 dependencies, recursive [flags 0x6000]
+    path-idx 0 NHID 0x0 [0xe495a48 0x0]
+    next hop VRF - 'default', table - 0xe0800000
+    next hop fcbb:bb00:3::/128 via fcbb:bb00:3::/48
+    SRv6 H.Encaps.Red SID-list {fcbb:bb00:3:e002::}
+
+
+#r3でのfcbb:bb00:3:e002::はuDT4であり、ヘッダーを外しNext HopはVRF 1からLookUpする
+
+RP/0/RP0/CPU0:r3# show cef ipv6 fcbb:bb00:3:e002::
+Mon Jan 30 06:52:28.495 UTC
+fcbb:bb00:3:e002::/64, version 56, SRv6 Endpoint uDT4, internal 0x1000001 0x0 (ptr 0xe209bb8) [1], 0x0 (0xe3a1d08), 0x0 (0xf636378)
+ Updated Jan 30 05:54:21.422
+ Prefix Len 64, traffic index 0, precedence n/a, priority 0
+   via ::ffff:0.0.0.0/128, 0 dependencies, weight 0, class 0 [flags 0x0]
+    path-idx 0 NHID 0x0 [0xdc2b120 0x0]
+    next hop VRF - '1', table - 0xe0000001
+    next hop ::ffff:0.0.0.0/128
+
+
+---Flex Algo---
+
+スライス毎に異なるMetricを設定可能=TE的なことができる
+スライス=Algoと呼ばれる
+実質的にスライス≒VRF(?)
+
+# Algo毎にLocatorを分ける
+
+#L3VPNはbb00だった
+
+
+segment-routing
+ srv6
+  locators
+   locator LATENCY
+    micro-segment behavior unode psp-usd
+    prefix fcbb:bb01:1::/48
+    algorithm 128
+   !
+  !
+ !
+!
+end
+
+
+# isisでFlex Algoを使うLocatorを使う設定を入れる
+
+router isis 1
+ flex-algo 128
+ !
+ address-family ipv6 unicast
+  segment-routing srv6
+   locator LATENCY
+   !
+  !
+ !
+!
+
+# R2でFlex AlgoのMetric-TypeでDelayを使うことを定義し、それを広報する
+
+router isis 1
+ flex-algo 128
+  metric-type delay
+  advertise-definition
+ !
+!
+
+# 各ルーターのInterface毎に、Metricを設定
+
+performance-measurement
+ interface GigabitEthernet0/0/0/0
+  delay-measurement
+   advertise-delay 5000
+  !
+ !
+ interface GigabitEthernet0/0/0/1
+  delay-measurement
+   advertise-delay 100
+  !
+ !
+!
+end
+
+LATENCYの各locator宛の経路はDelay Metricが加算され、gi0/0/0/1を通るようになっている=最短経路ではなくなっている
+
+i L2 fcbb:bb01:2::/48
+      [115/3200] via fe80::250:56ff:fead:cc32, 00:00:07, GigabitEthernet0/0/0/1
+i L2 fcbb:bb01:3::/48
+      [115/1200] via fe80::250:56ff:fead:cc32, 00:00:07, GigabitEthernet0/0/0/1
+i L2 fcbb:bb01:4::/48
+      [115/1100] via fe80::250:56ff:fead:cc32, 00:00:07, GigabitEthernet0/0/0/1
+i L2 fcbb:bb01:5::/48
+      [115/100] via fe80::250:56ff:fead:cc32, 00:00:07, GigabitEthernet0/0/0/1
+
+# r1,r3でVRF 1がISIS Metricを使うよう設定
+# この時点で、Locator MAINはVRF 1では使わなくなる
+
+configure
+router bgp 1
+vrf 1
+ address-family ipv4 unicast
+   segment-routing srv6
+     locator LATENCY
+ commit
+ end
+
+
+# uDT4 FunctionがLATENCY Locatorから割り当てられている
+
+RP/0/RP0/CPU0:r1#show segment-routing srv6 sid
+Mon Jan 30 08:16:48.374 UTC
+
+*** Locator: 'LATENCY' ***
+
+SID                         Behavior          Context                           Owner               State  RW
+--------------------------  ----------------  ------------------------------    ------------------  -----  --
+fcbb:bb01:1::               uN (PSP/USD)      'default':1                       sidmgr              InUse  Y
+fcbb:bb01:1:e000::          uA (PSP/USD)      [Gi0/0/0/0, Link-Local]:128       isis-1              InUse  Y
+fcbb:bb01:1:e001::          uA (PSP/USD)      [Gi0/0/0/1, Link-Local]:128       isis-1              InUse  Y
+fcbb:bb01:1:e002::          uDT4              '1'                               bgp-1               InUse  Y
+
+*** Locator: 'MAIN' ***
+
+fcbb:bb00:1::               uN (PSP/USD)      'default':1                       sidmgr              InUse  Y
+fcbb:bb00:1:e000::          uA (PSP/USD)      [Gi0/0/0/0, Link-Local]:0         isis-1              InUse  Y
+fcbb:bb00:1:e001::          uA (PSP/USD)      [Gi0/0/0/1, Link-Local]:0         isis-1              InUse  Y
+
+
+# 7.7.7.7のnext hopはLATENCYで定義されたbb01:3のuNであり、出ていくInterfareは0/0/0/1になっている
+RP/0/RP0/CPU0:r1#show cef vrf 1 7.7.7.7 detail
+Mon Jan 30 08:17:54.028 UTC
+7.7.7.7/32, version 15, SRv6 Headend, internal 0x5000001 0x30 (ptr 0xd2ca160) [1], 0x0 (0xe365960), 0x0 (0xf636378)
+ Updated Jan 30 08:16:27.075
+ Prefix Len 32, traffic index 0, precedence n/a, priority 3
+  gateway array (0xf774190) reference count 2, flags 0x10, source rib (7), 0 backups
+                [3 type 3 flags 0x8441 (0xe280b98) ext 0x0 (0x0)]
+  LW-LDI[type=3, refc=1, ptr=0xe365960, sh-ldi=0xe280b98]
+  gateway array update type-time 1 Jan 30 08:16:27.075
+ LDI Update time Jan 30 08:16:27.075
+ LW-LDI-TS Jan 30 08:16:27.075
+
+  Level 1 - Load distribution: 0
+  [0] via fcbb:bb01:3::/128, recursive
+
+   via fcbb:bb01:3::/128, 3 dependencies, recursive [flags 0x6000]
+    path-idx 0 NHID 0x0 [0xe493a78 0x0]
+    next hop VRF - 'default', table - 0xe0800000
+    next hop fcbb:bb01:3::/128 via fcbb:bb01:3::/48
+    SRv6 H.Encaps.Red SID-list {fcbb:bb01:3:e002::}
+
+    Load distribution: 0 (refcount 3)
+
+    Hash  OK  Interface                 Address
+    0     Y   GigabitEthernet0/0/0/1    remote
+
+
+---TI LFAの設定---
+
+＃ ISIS(IGP)はネットワーク全体のトポロジーを知っているので、事前にバックアップパスを計算できる
+# そのため、切り替え時の断時間ほぼ無しでバックアップパスに切り替えられる
+# TI-LFAの設定もISIS配下に入る
+
+
+router isis 1
+ interface GigabitEthernet0/0/0/0
+  address-family ipv6 unicast
+   fast-reroute per-prefix
+   fast-reroute per-prefix ti-lfa
+  !
+ !
+ interface GigabitEthernet0/0/0/1
+  address-family ipv6 unicast
+   fast-reroute per-prefix
+   fast-reroute per-prefix ti-lfa
+  !
+ !
+!
+
